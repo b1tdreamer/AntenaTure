@@ -3,11 +3,8 @@
  * Rotador de animaciones para 16 antenas (1 + 3 + 5 + 7).
  * Cada animación dura ANIMATION_DURATION_MS; luego pasa a la siguiente.
  *
- * Nunca se activan todos los relés a la vez: como máximo un anillo sube
- * por paso (máx. 7 antenas en el anillo exterior).
- *
- * Animación 0: ola continua centro → fuera; cada 3 s sube el siguiente
- * anillo y baja el anterior (sin esperar a que estén todas arriba).
+ * Todas las animaciones empiezan en el centro y avanzan hacia fuera.
+ * Solo una antena activa a la vez (máx. ~0,7 A).
  */
 
 const unsigned long ANIMATION_DURATION_MS = 60000UL;
@@ -23,14 +20,22 @@ const int PIN_ANTENAS[16] = {
   11, 12, 13, A0, A1, A2, A3
 };
 
-const int CIRCULO_0[] = {0};
-const int CIRCULO_1[] = {1, 2, 3};
-const int CIRCULO_2[] = {4, 5, 6, 7, 8};
-const int CIRCULO_3[] = {9, 10, 11, 12, 13, 14, 15};
+// Orden centro → fuera (índices 0..15)
+const int ORDEN_CENTRO_FUERA[] = {
+  0,
+  1, 2, 3,
+  4, 5, 6, 7, 8,
+  9, 10, 11, 12, 13, 14, 15
+};
+const int NUM_ANTENAS = 16;
 
-const int* CIRCULOS[]     = {CIRCULO_0, CIRCULO_1, CIRCULO_2, CIRCULO_3};
-const int  TAM_CIRCULOS[] = {1, 3, 5, 7};
-const int  NUM_CIRCULOS   = 4;
+// Anillos impares (0, 1 y 3) en orden centro → fuera
+const int ORDEN_ANILLOS_IMPARES[] = {
+  0,
+  1, 2, 3,
+  9, 10, 11, 12, 13, 14, 15
+};
+const int NUM_ANILLOS_IMPARES = 11;
 
 // --- Hardware ---
 
@@ -39,16 +44,8 @@ void escribirRele(int indice, bool activo) {
   digitalWrite(PIN_ANTENAS[indice], nivel ? HIGH : LOW);
 }
 
-void setCirculo(int circulo, bool subir) {
-  const int* miembros = CIRCULOS[circulo];
-  int n = TAM_CIRCULOS[circulo];
-  for (int i = 0; i < n; i++) {
-    escribirRele(miembros[i], subir);
-  }
-}
-
 void apagarTodas() {
-  for (int i = 0; i < 16; i++) {
+  for (int i = 0; i < NUM_ANTENAS; i++) {
     escribirRele(i, false);
   }
 }
@@ -65,30 +62,23 @@ void esperarHasta(unsigned long ahora, unsigned long& proximoEvento, unsigned lo
   proximoEvento = ahora + duracionMs;
 }
 
-int avanzarCirculo(int circulo, int direccion) {
-  circulo += direccion;
-  if (circulo >= NUM_CIRCULOS) {
-    circulo = 0;
-  }
-  if (circulo < 0) {
-    circulo = NUM_CIRCULOS - 1;
-  }
-  return circulo;
-}
-
-// Ola por anillos: sube el siguiente y baja el anterior cada DELAY_CIRCULO_MS
-struct OlaAnillos {
-  int circuloActivo;
-  int direccion;
+// Avanza una antena a la vez por una secuencia centro → fuera
+struct OlaAntena {
+  const int* secuencia;
+  int tamSecuencia;
+  int paso;
   int intervaloMs;
+  bool reiniciarAlFinal;
   unsigned long proximoEvento;
 
-  void reset(int dir, int intervalo) {
+  void reset(const int* seq, int tam, int intervalo, bool reiniciar) {
     apagarTodas();
-    direccion = dir;
+    secuencia = seq;
+    tamSecuencia = tam;
     intervaloMs = intervalo;
-    circuloActivo = (dir > 0) ? 0 : NUM_CIRCULOS - 1;
-    setCirculo(circuloActivo, true);
+    reiniciarAlFinal = reiniciar;
+    paso = 0;
+    escribirRele(secuencia[paso], true);
     proximoEvento = millis() + intervaloMs;
   }
 
@@ -97,24 +87,40 @@ struct OlaAnillos {
       return;
     }
 
-    int anterior = circuloActivo;
-    circuloActivo = avanzarCirculo(circuloActivo, direccion);
+    if (paso < 0) {
+      paso = 0;
+      escribirRele(secuencia[paso], true);
+      esperarHasta(ahora, proximoEvento, intervaloMs);
+      return;
+    }
 
-    setCirculo(anterior, false);
-    setCirculo(circuloActivo, true);
+    escribirRele(secuencia[paso], false);
+    paso++;
 
+    if (paso >= tamSecuencia) {
+      if (reiniciarAlFinal) {
+        paso = -1;
+        esperarHasta(ahora, proximoEvento, intervaloMs);
+        return;
+      }
+      paso = 0;
+    }
+
+    escribirRele(secuencia[paso], true);
     esperarHasta(ahora, proximoEvento, intervaloMs);
   }
 };
 
-OlaAnillos olaCentroFuera;
-OlaAnillos olaFueraCentro;
-OlaAnillos olaRapida;
+OlaAntena olaCentroFuera;
+OlaAntena olaReinicio;
+OlaAntena olaRapida;
+OlaAntena olaAnillosImpares;
+OlaAntena olaUnaAntena;
 
-// Animación 0: ola continua centro → fuera
+// Animación 0: ola continua centro → fuera, una antena a la vez
 namespace Anim0 {
   void reset() {
-    olaCentroFuera.reset(1, DELAY_CIRCULO_MS);
+    olaCentroFuera.reset(ORDEN_CENTRO_FUERA, NUM_ANTENAS, DELAY_CIRCULO_MS, false);
   }
 
   void tick(unsigned long ahora) {
@@ -122,21 +128,21 @@ namespace Anim0 {
   }
 }
 
-// Animación 1: ola continua fuera → centro
+// Animación 1: expansión centro → fuera y reinicio (todas abajo antes de repetir)
 namespace Anim1 {
   void reset() {
-    olaFueraCentro.reset(-1, DELAY_CIRCULO_MS);
+    olaReinicio.reset(ORDEN_CENTRO_FUERA, NUM_ANTENAS, DELAY_CIRCULO_MS, true);
   }
 
   void tick(unsigned long ahora) {
-    olaFueraCentro.tick(ahora);
+    olaReinicio.tick(ahora);
   }
 }
 
 // Animación 2: misma ola pero más rápida
 namespace Anim2 {
   void reset() {
-    olaRapida.reset(1, DELAY_RAPIDO_MS);
+    olaRapida.reset(ORDEN_CENTRO_FUERA, NUM_ANTENAS, DELAY_RAPIDO_MS, false);
   }
 
   void tick(unsigned long ahora) {
@@ -144,61 +150,25 @@ namespace Anim2 {
   }
 }
 
-// Animación 3: ola solo por anillos impares (1 y 3), nunca más de 7 antenas
+// Animación 3: anillos impares (0, 1 y 3), una antena a la vez
 namespace Anim3 {
-  const int ANILLOS[] = {1, 3};
-  const int NUM_ANILLOS = 2;
-
-  int indice;
-  int circuloActivo;
-  unsigned long proximoEvento;
-
   void reset() {
-    apagarTodas();
-    indice = 0;
-    circuloActivo = ANILLOS[0];
-    setCirculo(circuloActivo, true);
-    proximoEvento = millis() + DELAY_CIRCULO_MS;
+    olaAnillosImpares.reset(ORDEN_ANILLOS_IMPARES, NUM_ANILLOS_IMPARES, DELAY_CIRCULO_MS, false);
   }
 
   void tick(unsigned long ahora) {
-    if (ahora < proximoEvento) {
-      return;
-    }
-
-    int anterior = circuloActivo;
-    indice = (indice + 1) % NUM_ANILLOS;
-    circuloActivo = ANILLOS[indice];
-
-    setCirculo(anterior, false);
-    setCirculo(circuloActivo, true);
-
-    esperarHasta(ahora, proximoEvento, DELAY_CIRCULO_MS);
+    olaAnillosImpares.tick(ahora);
   }
 }
 
-// Animación 4: una sola antena a la vez (máx. ~0,7 A)
+// Animación 4: recorre todas las antenas en orden centro → fuera
 namespace Anim4 {
-  int indiceActivo;
-  unsigned long proximoEvento;
-
   void reset() {
-    apagarTodas();
-    indiceActivo = 0;
-    escribirRele(indiceActivo, true);
-    proximoEvento = millis() + DELAY_CIRCULO_MS;
+    olaUnaAntena.reset(ORDEN_CENTRO_FUERA, NUM_ANTENAS, DELAY_CIRCULO_MS, false);
   }
 
   void tick(unsigned long ahora) {
-    if (ahora < proximoEvento) {
-      return;
-    }
-
-    escribirRele(indiceActivo, false);
-    indiceActivo = (indiceActivo + 1) % 16;
-    escribirRele(indiceActivo, true);
-
-    esperarHasta(ahora, proximoEvento, DELAY_CIRCULO_MS);
+    olaUnaAntena.tick(ahora);
   }
 }
 
@@ -215,7 +185,7 @@ void anim4_tick(unsigned long ahora) { Anim4::tick(ahora); }
 
 const Animacion ANIMACIONES[] = {
   {"Ola centro-fuera",       anim0_reset, anim0_tick},
-  {"Ola fuera-centro",       anim1_reset, anim1_tick},
+  {"Expansion y reinicio",   anim1_reset, anim1_tick},
   {"Ola rapida",             anim2_reset, anim2_tick},
   {"Ola anillos impares",    anim3_reset, anim3_tick},
   {"Una antena a la vez",    anim4_reset, anim4_tick},
@@ -234,7 +204,7 @@ void cambiarAnimacion(int nuevoIndice) {
 }
 
 void setup() {
-  for (int i = 0; i < 16; i++) {
+  for (int i = 0; i < NUM_ANTENAS; i++) {
     pinMode(PIN_ANTENAS[i], OUTPUT);
     escribirRele(i, false);
   }
