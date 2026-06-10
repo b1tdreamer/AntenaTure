@@ -6,7 +6,7 @@
  * High Level Trigger: HIGH en INx = relé activado = antena sube.
  */
 
-const int DELAY_CIRCULO_MS = 3000;
+const int DELAY_CIRCULO_MS = 6000;
 const int PAUSA_ARRIBA_MS  = 3000;
 
 // true = HIGH activa relé | false = Low Level Trigger (invertir)
